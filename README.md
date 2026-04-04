@@ -1,3 +1,11 @@
+---
+title: Medical Triage Environment
+emoji: 🏥
+colorFrom: red
+colorTo: blue
+sdk: docker
+pinned: false
+---
 # Medical Triage & Discharge Planning Environment
 
 A reinforcement learning environment for training AI agents to perform clinical triage and discharge planning tasks. Built with OpenEnv for the Meta PyTorch Hackathon 2026.
