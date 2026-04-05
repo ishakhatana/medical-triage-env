@@ -1,7 +1,28 @@
 spec_version: 1
 name: medical_triage_env
-type: space
-runtime: fastapi
-app: server.app:app
-port: 8000
-
+type: environment
+runtime: docker
+app:
+  port: 7860
+  path: /web
+tags:
+  - openenv
+  - healthcare
+  - medical
+  - triage
+tasks:
+  - name: easy
+    difficulty: easy
+    description: "Triage prioritization: assign urgency level 1/2/3 to a patient."
+    max_steps: 3
+    reward_range: [0.0, 1.0]
+  - name: medium
+    difficulty: medium
+    description: "Investigation ordering: select appropriate diagnostic tests."
+    max_steps: 5
+    reward_range: [0.0, 1.0]
+  - name: hard
+    difficulty: hard
+    description: "Full discharge decision: diagnosis, disposition, medications, follow-up."
+    max_steps: 8
+    reward_range: [0.0, 1.0]

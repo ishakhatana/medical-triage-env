@@ -1,391 +1,253 @@
 #!/usr/bin/env python3
 """
-Inference script for Medical Triage Environment - LLM-Powered
-CRITICAL: Log format must be EXACT or scoring will fail!
+Inference Script — Medical Triage Environment
+=============================================
+Mandatory stdout format (exact, no deviations):
+  [START] task=<name> env=<benchmark> model=<model>
+  [STEP]  step=<n> action=<str> reward=<0.00> done=<true|false> error=<msg|null>
+  [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...>
+
+Required env vars:
+  API_BASE_URL   — LLM endpoint  (default: https://router.huggingface.co/v1)
+  MODEL_NAME     — model ID      (default: Qwen/Qwen2.5-72B-Instruct)
+  HF_TOKEN       — API key
+  BASE_URL       — running space (default: https://ishakhatana17-medical-triage-env.hf.space)
 """
-from dotenv import load_dotenv
-load_dotenv()  # This loads .env automatically!
+
+import asyncio
 import json
 import os
 import sys
-import asyncio
-from datetime import datetime
-import requests
+import textwrap
+from typing import List, Optional
+
 from openai import OpenAI
 from client import MedicalTriageEnv
 from models import TriageAction
-# Auto-load .env file
-# Environment/deployment configuration
-BASE_URL = os.getenv("BASE_URL", "https://ishakhatana17-medical-triage-env.hf.space")
-# ============================================================================
-# REQUIRED ENVIRONMENT VARIABLES
-# ============================================================================
 
-API_BASE_URL = os.getenv("API_BASE_URL")
-MODEL_NAME = os.getenv("MODEL_NAME")
-HF_TOKEN = os.getenv("HF_TOKEN")
+# ── Config ────────────────────────────────────────────────────────────────────
+API_BASE_URL: str = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME: str   = os.getenv("MODEL_NAME",   "Qwen/Qwen2.5-72B-Instruct")
+HF_TOKEN: str     = os.getenv("HF_TOKEN", "")
+BASE_URL: str     = os.getenv("BASE_URL", "https://ishakhatana17-medical-triage-env.hf.space")
+BENCHMARK: str    = "medical_triage_env"
 
-if not API_BASE_URL or not MODEL_NAME or not HF_TOKEN:
-    print("ERROR: Missing required environment variables!", file=sys.stderr)
-    print("Please set: API_BASE_URL, MODEL_NAME, HF_TOKEN", file=sys.stderr)
+# Fail fast if credentials missing
+if not HF_TOKEN:
+    print("ERROR: HF_TOKEN environment variable not set.", file=sys.stderr)
     sys.exit(1)
 
-# Initialize OpenAI Client (REQUIRED - points to HuggingFace)
-client = OpenAI(
-    base_url=API_BASE_URL,
-    api_key=HF_TOKEN
-)
+client = OpenAI(base_url=API_BASE_URL, api_key=HF_TOKEN)
+
+# Task config
+TASK_MAX_STEPS = {"easy": 3, "medium": 5, "hard": 8}
+SUCCESS_THRESHOLD = 0.5
+TEMPERATURE = 0.1
 
 
-# ============================================================================
-# LOG FUNCTIONS (EXACT FORMAT REQUIRED!)
-# ============================================================================
+# ── Fix 1: Mandatory plain-text log format ────────────────────────────────────
 
-def log_start(task_id: str):
-    """Emit START log"""
-    log = {
-        "type": "START",
-        "task": task_id,
-        "timestamp": datetime.utcnow().isoformat() + "Z"
-    }
-    print(json.dumps(log), flush=True)
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
 
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val  = str(done).lower()
+    print(f"[STEP] step={step} action={action} reward={reward:.2f} done={done_val} error={error_val}",
+          flush=True)
 
-def log_step(step: int, action: dict, observation: dict, reward: float):
-    """Emit STEP log"""
-    log = {
-        "type": "STEP",
-        "step": step,
-        "action": action,
-        "observation": observation,
-        "reward": reward
-    }
-    print(json.dumps(log), flush=True)
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}",
+          flush=True)
 
 
-def log_end(task_id: str, score: float, total_steps: int):
-    """Emit END log"""
-    log = {
-        "type": "END",
-        "task": task_id,
-        "score": score,
-        "total_steps": total_steps
-    }
-    print(json.dumps(log), flush=True)
+# ── LLM caller ────────────────────────────────────────────────────────────────
+
+SYSTEM_PROMPT = textwrap.dedent("""
+You are an experienced emergency physician making rapid triage decisions.
+You MUST respond with ONLY a valid JSON object — no markdown, no explanation.
+
+For task_type="easy":
+  {"task_type": "easy", "urgency_assignment": <1|2|3>}
+  1=Immediate (life-threatening), 2=Urgent, 3=Non-urgent
+
+For task_type="medium" (order tests one step at a time):
+  {"task_type": "medium", "ordered_investigations": ["test1", "test2"]}
+  Pass empty list [] when you are done ordering tests.
+  Available: ecg, troponin, cbc, cxr, ct_head, ct_abdomen, ultrasound,
+             urinalysis, blood_culture, lactate, bnp, inr, electrolytes,
+             rapid_strep, xray_ankle, xray_leg, blood_glucose, bhcg,
+             lumbar_puncture, endoscopy, compartment_pressure, urine_culture
+
+For task_type="hard":
+  {"task_type": "hard", "diagnosis": "<string>", "disposition": "<admit|discharge>",
+   "prescribed_medications": ["med1", "med2"], "follow_up_days": <int>}
+  SAFETY: NEVER discharge a patient with SpO2 < 90% or BP < 90/60.
+""").strip()
 
 
-# ============================================================================
-# LLM HELPER FUNCTIONS
-# ============================================================================
+def call_llm(task_type: str, patient: dict, ordered_so_far: List[str], step: int) -> dict:
+    """Call LLM and return parsed action dict. Falls back to safe defaults on error."""
+    vitals = (
+        f"HR {patient.get('heart_rate')} | "
+        f"BP {patient.get('blood_pressure')} | "
+        f"SpO2 {patient.get('spo2')}% | "
+        f"Temp {patient.get('temperature')}°C | "
+        f"RR {patient.get('respiratory_rate')}"
+    )
+    history_str = ", ".join(patient.get("past_medical_history") or []) or "None"
+    allergies_str = ", ".join(patient.get("allergies") or []) or "None"
+    ordered_str = ", ".join(ordered_so_far) if ordered_so_far else "None yet"
 
-def call_llm(prompt: str, max_tokens: int = 150) -> str:
-    """Call LLM via OpenAI Client"""
+    user_msg = textwrap.dedent(f"""
+    Step {step} | Task: {task_type}
+    Patient: {patient.get('age')}yo {patient.get('sex')}
+    Complaint: {patient.get('chief_complaint')}
+    Vitals: {vitals}
+    History: {history_str}
+    Allergies: {allergies_str}
+    Tests ordered so far: {ordered_str}
+
+    Respond with ONLY a JSON action object.
+    """).strip()
+
     try:
-        print(f"Calling LLM: {MODEL_NAME}...", file=sys.stderr)
-        
-        response = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model=MODEL_NAME,
             messages=[
-                {"role": "system", "content": "You are a medical triage expert. Respond concisely."},
-                {"role": "user", "content": prompt}
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user",   "content": user_msg},
             ],
-            max_tokens=max_tokens,
-            temperature=0.1,
-            timeout=30.0  # Add timeout
+            temperature=TEMPERATURE,
+            max_tokens=300,
         )
-        
-        result = response.choices[0].message.content.strip()
-        print(f"LLM Response: {result[:100]}...", file=sys.stderr)
-        return result
-        
-    except Exception as e:
-        print(f"LLM Error Details: {type(e).__name__}: {str(e)}", file=sys.stderr)
-        import traceback
-        traceback.print_exc(file=sys.stderr)
-        return ""
-
-def extract_number(text: str, default: int = 2) -> int:
-    """Extract first number from text"""
-    import re
-    numbers = re.findall(r'\b[123]\b', text)
-    return int(numbers[0]) if numbers else default
+        raw = (resp.choices[0].message.content or "").strip()
+        # Strip markdown fences if model added them
+        if raw.startswith("```"):
+            raw = raw.split("```")[1]
+            if raw.startswith("json"):
+                raw = raw[4:]
+        return json.loads(raw.strip())
+    except Exception as exc:
+        print(f"[DEBUG] LLM error step {step}: {exc}", file=sys.stderr)
+        return _safe_default(task_type, patient, ordered_so_far)
 
 
-def extract_tests(text: str) -> list:
-    """Extract test codes from text"""
-    # Common test abbreviations
-    tests = []
-    text_lower = text.lower()
-    
-    available = ["ecg", "troponin", "cbc", "cxr", "ct_head", "ct_abdomen",
-                 "ultrasound", "urinalysis", "blood_culture", "lactate",
-                 "bnp", "inr", "electrolytes"]
-    
-    for test in available:
-        if test in text_lower:
-            tests.append(test)
-    
-    return tests[:5] if tests else ["ecg", "cbc"]  # Default if none found
+def _safe_default(task_type: str, patient: dict, ordered_so_far: List[str]) -> dict:
+    """Conservative fallback action used when LLM fails."""
+    if task_type == "easy":
+        # Urgent if spo2 < 94 or hr > 110, else non-urgent
+        spo2 = patient.get("spo2", 99)
+        hr   = patient.get("heart_rate", 80)
+        urgency = 1 if (spo2 < 90 or hr > 120) else (2 if spo2 < 95 else 3)
+        return {"task_type": "easy", "urgency_assignment": urgency}
 
+    elif task_type == "medium":
+        # Return empty list to end ordering phase
+        if ordered_so_far:
+            return {"task_type": "medium", "ordered_investigations": []}
+        return {"task_type": "medium", "ordered_investigations": ["ecg", "cbc"]}
 
-# ============================================================================
-# TASK RUNNERS (LLM-POWERED)
-# ============================================================================
-
-async def run_easy_task(env_client):
-    """Task 1: Triage Prioritization"""
-    task_id = "easy"
-    log_start(task_id)
-    
-    # Reset environment
-    result = await env_client.reset()
-    instruction = result.observation.task_instruction
-    patient = result.observation.current_patient
-    
-    # LOG PATIENT DETAILS (so you can see what LLM is analyzing)
-    print("\n" + "="*60, file=sys.stderr)
-    print("EASY TASK - PATIENT SCENARIO:", file=sys.stderr)
-    print(f"ID: {patient['id']}", file=sys.stderr)
-    print(f"Age: {patient['age']}, Sex: {patient['sex']}", file=sys.stderr)
-    print(f"Chief Complaint: {patient['chief_complaint']}", file=sys.stderr)
-    print(f"Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}", file=sys.stderr)
-    print(f"History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}", file=sys.stderr)
-    print(f"Allergies: {', '.join(patient['allergies']) if patient['allergies'] else 'None'}", file=sys.stderr)
-    print("="*60 + "\n", file=sys.stderr)
-    
-    # Create LLM prompt with ACTUAL patient details
-    prompt = f"""You are triaging a patient in an emergency department.
-
-{instruction}
-
-Patient: {patient['age']}-year-old {patient['sex']}
-Chief Complaint: {patient['chief_complaint']}
-Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}
-Medical History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}
-
-What urgency level? Respond with ONLY a number: 1, 2, or 3"""
-    
-    # Call LLM
-    llm_response = call_llm(prompt, max_tokens=50)
-    urgency = extract_number(llm_response, default=2)
-    
-    # Execute action
-    action = TriageAction(
-        task_type="easy",
-        urgency_assignment=urgency
-    )
-    
-    result = await env_client.step(action)
-    
-    # LOG THE DECISION
-    print(f"LLM Decision: Urgency = {urgency}", file=sys.stderr)
-    print(f"Environment Reward: {result.reward}", file=sys.stderr)
-    print("="*60 + "\n", file=sys.stderr)
-    
-    log_step(
-        step=1,
-        action={"task_type": "easy", "urgency_assignment": urgency},
-        observation={"reward": result.reward, "done": result.done},
-        reward=result.reward
-    )
-    
-    # Get final score from grader
-    response = requests.get(f"{BASE_URL}/grader?task_id=easy")
-    score = response.json()["score"]
-    
-    log_end(task_id, score, total_steps=1)
-    return score
-
-
-async def run_medium_task(env_client):
-    """Task 2: Investigation Ordering"""
-    task_id = "medium"
-    log_start(task_id)
-    
-    # Reset environment
-    result = await env_client.reset()
-    instruction = result.observation.task_instruction
-    patient = result.observation.current_patient
-    
-    # LOG PATIENT DETAILS
-    print("\n" + "="*60, file=sys.stderr)
-    print("MEDIUM TASK - PATIENT SCENARIO:", file=sys.stderr)
-    print(f"ID: {patient['id']}", file=sys.stderr)
-    print(f"Age: {patient['age']}, Sex: {patient['sex']}", file=sys.stderr)
-    print(f"Chief Complaint: {patient['chief_complaint']}", file=sys.stderr)
-    print(f"Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}", file=sys.stderr)
-    print(f"History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}", file=sys.stderr)
-    print(f"Allergies: {', '.join(patient['allergies']) if patient['allergies'] else 'None'}", file=sys.stderr)
-    print("="*60 + "\n", file=sys.stderr)
-    
-    # Build prompt with actual patient details
-    prompt = f"""{instruction}
-
-Patient Information:
-- Chief Complaint: {patient['chief_complaint']}
-- Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}
-- Medical History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}
-- Allergies: {', '.join(patient['allergies']) if patient['allergies'] else 'None'}
-
-Available tests: ECG, troponin, CBC, CXR, CT head, CT abdomen, ultrasound, urinalysis, blood culture, lactate, BNP, INR, electrolytes
-
-Which diagnostic tests would you order? List test names separated by commas."""
-    
-    # Call LLM
-    llm_response = call_llm(prompt, max_tokens=100)
-    tests = extract_tests(llm_response)
-    
-    # LOG THE DECISION
-    print(f"LLM Ordered Tests: {tests}", file=sys.stderr)
-    
-    # Execute action
-    action = TriageAction(
-        task_type="medium",
-        ordered_investigations=tests
-    )
-    
-    result = await env_client.step(action)
-    
-    print(f"Environment Reward: {result.reward}", file=sys.stderr)
-    print("="*60 + "\n", file=sys.stderr)
-    
-    log_step(
-        step=1,
-        action={"task_type": "medium", "ordered_investigations": tests},
-        observation={"reward": result.reward, "done": result.done},
-        reward=result.reward
-    )
-    
-    # Get final score
-    response = requests.get(f"{BASE_URL}/grader?task_id=medium")
-    score = response.json()["score"]
-    
-    log_end(task_id, score, total_steps=1)
-    return score
-
-
-async def run_hard_task(env_client):
-    """Task 3: Full Discharge Decision"""
-    task_id = "hard"
-    log_start(task_id)
-    
-    # Reset environment
-    result = await env_client.reset()
-    instruction = result.observation.task_instruction
-    patient = result.observation.current_patient
-    
-    # LOG PATIENT DETAILS
-    print("\n" + "="*60, file=sys.stderr)
-    print("HARD TASK - PATIENT SCENARIO:", file=sys.stderr)
-    print(f"ID: {patient['id']}", file=sys.stderr)
-    print(f"Age: {patient['age']}, Sex: {patient['sex']}", file=sys.stderr)
-    print(f"Chief Complaint: {patient['chief_complaint']}", file=sys.stderr)
-    print(f"Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}", file=sys.stderr)
-    print(f"History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}", file=sys.stderr)
-    print(f"Allergies: {', '.join(patient['allergies']) if patient['allergies'] else 'None'}", file=sys.stderr)
-    print("="*60 + "\n", file=sys.stderr)
-    
-    # Create LLM prompt with ACTUAL patient
-    prompt = f"""{instruction}
-
-Patient: {patient['age']}-year-old {patient['sex']}
-Chief Complaint: {patient['chief_complaint']}
-Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}
-Medical History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}
-Allergies: {', '.join(patient['allergies']) if patient['allergies'] else 'None'}
-
-Provide complete discharge plan:
-1. Diagnosis (one phrase)
-2. Disposition: admit or discharge
-3. Medications (2-3)
-4. Follow-up days (number)
-
-Format: diagnosis|disposition|med1,med2|days"""
-    
-    # Call LLM
-    llm_response = call_llm(prompt, max_tokens=150)
-    
-    # Parse response (simple fallback if format is wrong)
-    parts = llm_response.split('|')
-    diagnosis = parts[0].strip() if len(parts) > 0 else "unknown"
-    disposition = parts[1].strip().lower() if len(parts) > 1 else "admit"
-    meds = parts[2].split(',') if len(parts) > 2 else ["supportive_care"]
-    meds = [m.strip() for m in meds[:3]]
-    
-    try:
-        follow_up = int(parts[3]) if len(parts) > 3 else 7
-    except:
-        follow_up = 7
-    
-    # LOG THE DECISION
-    print(f"LLM Decision:", file=sys.stderr)
-    print(f"  Diagnosis: {diagnosis}", file=sys.stderr)
-    print(f"  Disposition: {disposition}", file=sys.stderr)
-    print(f"  Medications: {meds}", file=sys.stderr)
-    print(f"  Follow-up: {follow_up} days", file=sys.stderr)
-    
-    # Execute action
-    action = TriageAction(
-        task_type="hard",
-        diagnosis=diagnosis,
-        disposition=disposition,
-        prescribed_medications=meds,
-        follow_up_days=follow_up
-    )
-    
-    result = await env_client.step(action)
-    
-    print(f"Environment Reward: {result.reward}", file=sys.stderr)
-    print("="*60 + "\n", file=sys.stderr)
-    
-    log_step(
-        step=1,
-        action={
+    else:  # hard
+        spo2 = patient.get("spo2", 99)
+        sbp  = int((patient.get("blood_pressure") or "120/80").split("/")[0])
+        disp = "admit" if (spo2 < 95 or sbp < 100) else "discharge"
+        return {
             "task_type": "hard",
-            "diagnosis": diagnosis,
-            "disposition": disposition,
-            "prescribed_medications": meds,
-            "follow_up_days": follow_up
-        },
-        observation={"reward": result.reward, "done": result.done},
-        reward=result.reward
-    )
-    
-    # Get final score
-    response = requests.get(f"{BASE_URL}/grader?task_id=hard")
-    score = response.json()["score"]
-    
-    log_end(task_id, score, total_steps=1)
-    return score
+            "diagnosis": "clinical assessment pending",
+            "disposition": disp,
+            "prescribed_medications": ["supportive care"],
+            "follow_up_days": 1,
+        }
 
 
-# ============================================================================
-# MAIN ENTRY POINT
-# ============================================================================
+def make_action(data: dict) -> TriageAction:
+    return TriageAction(**{k: v for k, v in data.items() if v is not None})
 
-async def main():
-    """Run all tasks and output scores"""
+
+def action_label(data: dict) -> str:
+    """Short human-readable label for the [STEP] line."""
+    t = data.get("task_type", "?")
+    if t == "easy":
+        return f"triage(urgency={data.get('urgency_assignment')})"
+    elif t == "medium":
+        tests = data.get("ordered_investigations", [])
+        return f"order_tests({tests})"
+    else:
+        return f"discharge(disp={data.get('disposition')},dx={str(data.get('diagnosis',''))[:30]})"
+
+
+# ── Fix 7+8: multi-step episode runners, explicit task passed to reset() ──────
+
+async def run_episode(task_name: str) -> None:
+    """Run one full episode for the given task with proper multi-step trajectory."""
+    rewards: List[float] = []
+    steps_taken = 0
+    success = False
+    score = 0.0
+    max_steps = TASK_MAX_STEPS[task_name]
+
+    log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
+
+    # Fix 2: score comes from result.reward, not from /grader endpoint
+    # Fix 8: separate env context per task, pass task explicitly to reset()
     try:
-        # Initialize environment client
-        async with MedicalTriageEnv(base_url=BASE_URL) as env_client:
-            # Run all 3 tasks
-            easy_score = await run_easy_task(env_client)
-            medium_score = await run_medium_task(env_client)
-            hard_score = await run_hard_task(env_client)
-            
-            # Print summary (for human readability)
-            print("\n" + "="*50, file=sys.stderr)
-            print("FINAL SCORES (LLM-POWERED):", file=sys.stderr)
-            print(f"  Easy:   {easy_score:.3f}", file=sys.stderr)
-            print(f"  Medium: {medium_score:.3f}", file=sys.stderr)
-            print(f"  Hard:   {hard_score:.3f}", file=sys.stderr)
-            print("="*50, file=sys.stderr)
-        
-    except Exception as e:
-        print(f"ERROR: {str(e)}", file=sys.stderr)
-        import traceback
-        traceback.print_exc(file=sys.stderr)
-        sys.exit(1)
+        async with MedicalTriageEnv(base_url=BASE_URL) as env:
+            result = await env.reset(task=task_name)   # Fix 8: explicit task
+            obs    = result.observation
+            patient = obs.current_patient or {}
+            ordered_so_far: List[str] = []
+
+            for step in range(1, max_steps + 1):
+                if result.done:
+                    break
+
+                # Get LLM action
+                action_data = call_llm(task_name, patient, ordered_so_far, step)
+                action_data["task_type"] = task_name   # always enforce correct task
+
+                # Track ordered tests for the medium prompt
+                if task_name == "medium":
+                    new = action_data.get("ordered_investigations") or []
+                    ordered_so_far.extend(t for t in new if t not in ordered_so_far)
+
+                action  = make_action(action_data)
+                label   = action_label(action_data)
+
+                result  = await env.step(action)
+                reward  = result.reward or 0.0
+                done    = result.done
+                obs     = result.observation
+                error   = None
+
+                rewards.append(reward)
+                steps_taken = step
+
+                log_step(step=step, action=label, reward=reward, done=done, error=error)
+
+                if done:
+                    break
+
+            # Normalise score to [0,1]
+            if rewards:
+                score = max(0.0, min(1.0, max(rewards)))   # best step reward
+            success = score >= SUCCESS_THRESHOLD
+
+    except Exception as exc:
+        print(f"[DEBUG] Episode error: {exc}", file=sys.stderr)
+        import traceback; traceback.print_exc(file=sys.stderr)
+    finally:
+        # Fix 2: log_end is ALWAYS emitted, even on exception
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+async def main() -> None:
+    for task in ["easy", "medium", "hard"]:
+        await run_episode(task)
+        print("", flush=True)   # blank separator between tasks
 
 
 if __name__ == "__main__":
