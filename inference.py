@@ -15,7 +15,8 @@ from openai import OpenAI
 from client import MedicalTriageEnv
 from models import TriageAction
 # Auto-load .env file
-
+# Environment/deployment configuration
+BASE_URL = os.getenv("BASE_URL", "https://ishakhatana17-medical-triage-env.hf.space")
 # ============================================================================
 # REQUIRED ENVIRONMENT VARIABLES
 # ============================================================================
@@ -138,23 +139,35 @@ async def run_easy_task(env_client):
     
     # Reset environment
     result = await env_client.reset()
-    
-    # Get patient info from observation
     instruction = result.observation.task_instruction
+    patient = result.observation.current_patient
     
-    # Create LLM prompt
+    # LOG PATIENT DETAILS (so you can see what LLM is analyzing)
+    print("\n" + "="*60, file=sys.stderr)
+    print("EASY TASK - PATIENT SCENARIO:", file=sys.stderr)
+    print(f"ID: {patient['id']}", file=sys.stderr)
+    print(f"Age: {patient['age']}, Sex: {patient['sex']}", file=sys.stderr)
+    print(f"Chief Complaint: {patient['chief_complaint']}", file=sys.stderr)
+    print(f"Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}", file=sys.stderr)
+    print(f"History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}", file=sys.stderr)
+    print(f"Allergies: {', '.join(patient['allergies']) if patient['allergies'] else 'None'}", file=sys.stderr)
+    print("="*60 + "\n", file=sys.stderr)
+    
+    # Create LLM prompt with ACTUAL patient details
     prompt = f"""You are triaging a patient in an emergency department.
 
 {instruction}
 
-Patient presents with chest pain and shortness of breath.
-Vital signs: HR 110, BP 90/60, SpO2 94%, Temp 37.8°C
+Patient: {patient['age']}-year-old {patient['sex']}
+Chief Complaint: {patient['chief_complaint']}
+Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}
+Medical History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}
 
 What urgency level? Respond with ONLY a number: 1, 2, or 3"""
     
     # Call LLM
     llm_response = call_llm(prompt, max_tokens=50)
-    urgency = extract_number(llm_response, default=1)
+    urgency = extract_number(llm_response, default=2)
     
     # Execute action
     action = TriageAction(
@@ -164,6 +177,11 @@ What urgency level? Respond with ONLY a number: 1, 2, or 3"""
     
     result = await env_client.step(action)
     
+    # LOG THE DECISION
+    print(f"LLM Decision: Urgency = {urgency}", file=sys.stderr)
+    print(f"Environment Reward: {result.reward}", file=sys.stderr)
+    print("="*60 + "\n", file=sys.stderr)
+    
     log_step(
         step=1,
         action={"task_type": "easy", "urgency_assignment": urgency},
@@ -172,7 +190,7 @@ What urgency level? Respond with ONLY a number: 1, 2, or 3"""
     )
     
     # Get final score from grader
-    response = requests.get("http://localhost:8000/grader?task_id=easy")
+    response = requests.get(f"{BASE_URL}/grader?task_id=easy")
     score = response.json()["score"]
     
     log_end(task_id, score, total_steps=1)
@@ -188,6 +206,17 @@ async def run_medium_task(env_client):
     result = await env_client.reset()
     instruction = result.observation.task_instruction
     patient = result.observation.current_patient
+    
+    # LOG PATIENT DETAILS
+    print("\n" + "="*60, file=sys.stderr)
+    print("MEDIUM TASK - PATIENT SCENARIO:", file=sys.stderr)
+    print(f"ID: {patient['id']}", file=sys.stderr)
+    print(f"Age: {patient['age']}, Sex: {patient['sex']}", file=sys.stderr)
+    print(f"Chief Complaint: {patient['chief_complaint']}", file=sys.stderr)
+    print(f"Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}", file=sys.stderr)
+    print(f"History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}", file=sys.stderr)
+    print(f"Allergies: {', '.join(patient['allergies']) if patient['allergies'] else 'None'}", file=sys.stderr)
+    print("="*60 + "\n", file=sys.stderr)
     
     # Build prompt with actual patient details
     prompt = f"""{instruction}
@@ -206,6 +235,9 @@ Which diagnostic tests would you order? List test names separated by commas."""
     llm_response = call_llm(prompt, max_tokens=100)
     tests = extract_tests(llm_response)
     
+    # LOG THE DECISION
+    print(f"LLM Ordered Tests: {tests}", file=sys.stderr)
+    
     # Execute action
     action = TriageAction(
         task_type="medium",
@@ -213,6 +245,9 @@ Which diagnostic tests would you order? List test names separated by commas."""
     )
     
     result = await env_client.step(action)
+    
+    print(f"Environment Reward: {result.reward}", file=sys.stderr)
+    print("="*60 + "\n", file=sys.stderr)
     
     log_step(
         step=1,
@@ -222,7 +257,7 @@ Which diagnostic tests would you order? List test names separated by commas."""
     )
     
     # Get final score
-    response = requests.get("http://localhost:8000/grader?task_id=medium")
+    response = requests.get(f"{BASE_URL}/grader?task_id=medium")
     score = response.json()["score"]
     
     log_end(task_id, score, total_steps=1)
@@ -237,19 +272,29 @@ async def run_hard_task(env_client):
     # Reset environment
     result = await env_client.reset()
     instruction = result.observation.task_instruction
+    patient = result.observation.current_patient
     
-    # Create LLM prompt
+    # LOG PATIENT DETAILS
+    print("\n" + "="*60, file=sys.stderr)
+    print("HARD TASK - PATIENT SCENARIO:", file=sys.stderr)
+    print(f"ID: {patient['id']}", file=sys.stderr)
+    print(f"Age: {patient['age']}, Sex: {patient['sex']}", file=sys.stderr)
+    print(f"Chief Complaint: {patient['chief_complaint']}", file=sys.stderr)
+    print(f"Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}", file=sys.stderr)
+    print(f"History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}", file=sys.stderr)
+    print(f"Allergies: {', '.join(patient['allergies']) if patient['allergies'] else 'None'}", file=sys.stderr)
+    print("="*60 + "\n", file=sys.stderr)
+    
+    # Create LLM prompt with ACTUAL patient
     prompt = f"""{instruction}
 
-Patient: 54-year-old male
-Chief complaint: Chest pain radiating to left arm, sweating
-Vitals: HR 110, BP 90/60, SpO2 94%, Temp 37.8°C
-History: Hypertension, Type 2 Diabetes
-Allergies: Penicillin
+Patient: {patient['age']}-year-old {patient['sex']}
+Chief Complaint: {patient['chief_complaint']}
+Vitals: HR {patient['heart_rate']}, BP {patient['blood_pressure']}, SpO2 {patient['spo2']}%, Temp {patient['temperature']}°C, RR {patient['respiratory_rate']}
+Medical History: {', '.join(patient['past_medical_history']) if patient['past_medical_history'] else 'None'}
+Allergies: {', '.join(patient['allergies']) if patient['allergies'] else 'None'}
 
-Lab results show elevated troponin. ECG shows ST elevation.
-
-Provide:
+Provide complete discharge plan:
 1. Diagnosis (one phrase)
 2. Disposition: admit or discharge
 3. Medications (2-3)
@@ -262,15 +307,22 @@ Format: diagnosis|disposition|med1,med2|days"""
     
     # Parse response (simple fallback if format is wrong)
     parts = llm_response.split('|')
-    diagnosis = parts[0].strip() if len(parts) > 0 else "acute_myocardial_infarction"
+    diagnosis = parts[0].strip() if len(parts) > 0 else "unknown"
     disposition = parts[1].strip().lower() if len(parts) > 1 else "admit"
-    meds = parts[2].split(',') if len(parts) > 2 else ["aspirin", "nitroglycerin"]
+    meds = parts[2].split(',') if len(parts) > 2 else ["supportive_care"]
     meds = [m.strip() for m in meds[:3]]
     
     try:
         follow_up = int(parts[3]) if len(parts) > 3 else 7
     except:
         follow_up = 7
+    
+    # LOG THE DECISION
+    print(f"LLM Decision:", file=sys.stderr)
+    print(f"  Diagnosis: {diagnosis}", file=sys.stderr)
+    print(f"  Disposition: {disposition}", file=sys.stderr)
+    print(f"  Medications: {meds}", file=sys.stderr)
+    print(f"  Follow-up: {follow_up} days", file=sys.stderr)
     
     # Execute action
     action = TriageAction(
@@ -282,6 +334,9 @@ Format: diagnosis|disposition|med1,med2|days"""
     )
     
     result = await env_client.step(action)
+    
+    print(f"Environment Reward: {result.reward}", file=sys.stderr)
+    print("="*60 + "\n", file=sys.stderr)
     
     log_step(
         step=1,
@@ -297,7 +352,7 @@ Format: diagnosis|disposition|med1,med2|days"""
     )
     
     # Get final score
-    response = requests.get("http://localhost:8000/grader?task_id=hard")
+    response = requests.get(f"{BASE_URL}/grader?task_id=hard")
     score = response.json()["score"]
     
     log_end(task_id, score, total_steps=1)
@@ -312,7 +367,7 @@ async def main():
     """Run all tasks and output scores"""
     try:
         # Initialize environment client
-        async with MedicalTriageEnv(base_url="http://localhost:8000") as env_client:
+        async with MedicalTriageEnv(base_url=BASE_URL) as env_client:
             # Run all 3 tasks
             easy_score = await run_easy_task(env_client)
             medium_score = await run_medium_task(env_client)
